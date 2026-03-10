@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -7,6 +7,10 @@ import httpx
 import re
 import os
 import unicodedata
+import pdfplumber
+import ollama
+import json
+import io
 
 from sentence_transformers import SentenceTransformer
 import faiss
@@ -786,6 +790,215 @@ def search_freelancers(req: SearchRequest):
     print(f"[AI] Freelancer search [{mode}]: '{req.prompt}' → {len(results)} results "
           f"(best={round(best_score*100,1)}%, threshold={round(dynamic_threshold*100,1)}%)")
     return results
+
+
+@app.post("/extract-cv")
+async def extract_cv(file: UploadFile = File(...)):
+    """Extract structured CV data from a PDF using Ollama llama3.2."""
+    try:
+        content = await file.read()
+
+        # Extract raw text from PDF
+        text = ""
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+
+        # Truncate to avoid exceeding llama3.2 context limit
+        if len(text) > 8000:
+            text = text[:8000]
+
+        print(f"[AI-EXTRACT] Extracted {len(text)} chars from PDF")
+
+        prompt = f"""You are an expert CV parser specialized in French and English resumes.
+Extract structured data from the CV below and return ONLY a valid JSON object.
+
+=== LANGUAGE MAPPING (CRITICAL) ===
+Scan the ENTIRE CV for any section labeled: Langues, Languages, Compétences linguistiques,
+Langue parlées, Spoken languages, or similar.
+Extract EVERY language found — do not stop after 2, list ALL of them.
+Use these exact mappings:
+- Français / French / FR → "FRENCH"
+- Anglais / English / EN → "ENGLISH"
+- Arabe / Arabic / AR / العربية → "ARABIC"
+- Espagnol / Spanish → "SPANISH"
+- Allemand / German / Deutsch → "GERMAN"
+- Italien / Italian → "ITALIAN"
+- Portugais / Portuguese → "PORTUGUESE"
+- Chinois / Chinese / Mandarin → "CHINESE"
+- Japonais / Japanese → "JAPANESE"
+- Any other language → skip it, do not include it
+Allowed values ONLY: FRENCH, ENGLISH, ARABIC, SPANISH, GERMAN, ITALIAN, PORTUGUESE, CHINESE, JAPANESE
+Do NOT use "OTHER".
+
+=== CERTIFICATIONS vs EDUCATION (CRITICAL) ===
+CERTIFICATIONS are professional credentials issued by tech or industry bodies:
+  Examples: AWS, Azure, Google Cloud, Cisco CCNA, Oracle, Microsoft, Scrum Master, PMP,
+            TOEFL, IELTS, DELF, DALF, CompTIA, CFA, PMI, Coursera, Udemy certificates
+EDUCATION is academic degrees from schools/universities:
+  Examples: Licence, Master, Doctorat, Ingénieur, BTS, DUT, Baccalauréat, Bachelor, MBA,
+            Diplôme national → these go ONLY in education, NEVER in certifications.
+If certifications section is empty or absent, return empty array [].
+
+=== DATE RULES ===
+- Format: YYYY-MM-DD. If only year: YYYY-01-01
+- French months: Janvier=01, Février=02, Mars=03, Avril=04, Mai=05, Juin=06,
+  Juillet=07, Août=08, Septembre=09, Octobre=10, Novembre=11, Décembre=12
+- "Présent" / "Aujourd'hui" / "Current" / "En cours" → isCurrent: true, endDate: null
+
+=== SKILLS EXTRACTION ===
+The skills section may be labeled differently in French or English CVs:
+French labels: Compétences, Compétences techniques, Compétences informatiques,
+  Technologies maîtrisées, Savoir-faire, Outils, Langages de programmation,
+  Frameworks, Environnement technique, Outils & Technologies, Stack technique,
+  Compétences clés, Logiciels, Maîtrise technique
+English labels: Skills, Technical Skills, Technologies, Tools, Tech Stack,
+  Key Skills, Core Competencies, Programming Languages, Frameworks
+Extract ALL technical and soft skills found in these sections.
+
+=== JSON STRUCTURE ===
+{{
+  "bio": "2-3 sentence professional summary, or null if no summary section exists",
+  "workExperience": [
+    {{
+      "jobTitle": "exact job title from CV",
+      "company": "company name",
+      "startDate": "YYYY-MM-DD",
+      "endDate": "YYYY-MM-DD or null if current",
+      "isCurrent": false,
+      "description": "responsibilities and achievements, or empty string"
+    }}
+  ],
+  "education": [
+    {{
+      "diploma": "exact degree/diploma name",
+      "institution": "school or university name",
+      "year": 2020,
+      "description": "specialization or details, or empty string"
+    }}
+  ],
+  "certifications": [
+    {{
+      "name": "exact certification name",
+      "issuer": "issuing organization (AWS, Microsoft, Cisco, etc.)",
+      "issueDate": "YYYY-MM-DD or null",
+      "expiryDate": null
+    }}
+  ],
+  "skills": ["skill1", "skill2", "skill3"],
+  "languages": ["FRENCH", "ENGLISH", "ARABIC", "GERMAN"]
+}}
+
+IMPORTANT FOR LANGUAGES: Extract ALL languages listed in the CV, not just the first two.
+A CV can have 1, 2, 3, 4 or more languages. List every single one you find.
+
+CV TEXT:
+{text}"""
+
+        response = ollama.chat(
+            model='llama3.2',
+            messages=[{'role': 'user', 'content': prompt}],
+            format='json',
+            options={'temperature': 0.1}
+        )
+
+        # Compatible avec ollama >= 0.2.x (objet Pydantic) et < 0.2.x (dict)
+        try:
+            raw = response.message.content.strip()
+        except AttributeError:
+            raw = response['message']['content'].strip()
+
+        print(f"[AI-EXTRACT] Raw LLM response (first 300 chars): {raw[:300]}")
+
+        # Find the JSON object in the response (LLM sometimes adds extra text)
+        start = raw.find('{')
+        end = raw.rfind('}') + 1
+
+        if start == -1 or end <= start:
+            print(f"[AI-EXTRACT] No JSON in response: {raw[:300]}")
+            raise HTTPException(status_code=500, detail="AI could not produce structured data from this CV")
+
+        json_str = raw[start:end]
+        result = json.loads(json_str)
+
+        # ── Post-validation : nettoyage des données extraites ─────────────────
+
+        # 1. Filtrer les langues invalides (le LLM peut retourner "Français" au lieu de "FRENCH")
+        VALID_LANGUAGES = {"FRENCH", "ENGLISH", "ARABIC", "SPANISH", "GERMAN",
+                           "ITALIAN", "PORTUGUESE", "CHINESE", "JAPANESE", "OTHER"}
+        LANGUAGE_FIX = {
+            # French
+            "FRANÇAIS": "FRENCH", "FRANCAIS": "FRENCH", "FRENCH": "FRENCH",
+            "FR": "FRENCH", "LANGUE FRANÇAISE": "FRENCH",
+            # English
+            "ANGLAIS": "ENGLISH", "ENGLISH": "ENGLISH", "EN": "ENGLISH",
+            "LANGUE ANGLAISE": "ENGLISH",
+            # Arabic
+            "ARABE": "ARABIC", "ARABIC": "ARABIC", "AR": "ARABIC",
+            "LANGUE ARABE": "ARABIC", "ARABE DIALECTAL": "ARABIC",
+            "ARABE CLASSIQUE": "ARABIC", "ARABE MODERNE": "ARABIC",
+            # German
+            "ALLEMAND": "GERMAN", "GERMAN": "GERMAN", "DEUTSCH": "GERMAN",
+            "LANGUE ALLEMANDE": "GERMAN",
+            # Spanish
+            "ESPAGNOL": "SPANISH", "SPANISH": "SPANISH", "ESPAÑOL": "SPANISH",
+            # Italian
+            "ITALIEN": "ITALIAN", "ITALIAN": "ITALIAN",
+            # Portuguese
+            "PORTUGAIS": "PORTUGUESE", "PORTUGUESE": "PORTUGUESE",
+            # Chinese
+            "CHINOIS": "CHINESE", "CHINESE": "CHINESE", "MANDARIN": "CHINESE",
+            "MANDARIN CHINESE": "CHINESE",
+            # Japanese
+            "JAPONAIS": "JAPANESE", "JAPANESE": "JAPANESE",
+        }
+        raw_langs = result.get("languages", [])
+        cleaned_langs = []
+        for lang in raw_langs:
+            normalized = lang.upper().strip()
+            fixed = LANGUAGE_FIX.get(normalized, normalized)
+            if fixed in VALID_LANGUAGES and fixed not in cleaned_langs and fixed != "OTHER":
+                cleaned_langs.append(fixed)
+        result["languages"] = cleaned_langs
+
+        # 2. Filtrer les certifications qui sont en réalité des diplômes académiques
+        ACADEMIC_KEYWORDS = [
+            "licence", "master", "doctorat", "ingénieur", "ingenieur", "bts", "dut",
+            "baccalauréat", "baccalaureat", "bachelor", "mba", "dut", "iut", "diplôme",
+            "diplome", "deug", "deust", "licence professionnelle", "magistère",
+            "licence pro", "master pro", "master recherche"
+        ]
+        raw_certifs = result.get("certifications", [])
+        cleaned_certifs = []
+        for cert in raw_certifs:
+            name_lower = cert.get("name", "").lower()
+            if not any(kw in name_lower for kw in ACADEMIC_KEYWORDS):
+                cleaned_certifs.append(cert)
+            else:
+                print(f"[AI-EXTRACT] Removed academic entry from certifications: {cert.get('name')}")
+        result["certifications"] = cleaned_certifs
+
+        print(f"[AI-EXTRACT] Final: {len(result.get('workExperience', []))} jobs, "
+              f"{len(result.get('education', []))} edu, "
+              f"{len(cleaned_certifs)} certifs, "
+              f"{len(result.get('skills', []))} skills, "
+              f"languages={result.get('languages', [])}")
+
+        return result
+
+    except json.JSONDecodeError as e:
+        print(f"[AI-EXTRACT] JSON parse error: {e}")
+        raise HTTPException(status_code=500, detail="AI returned invalid JSON — try again")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[AI-EXTRACT] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"CV extraction failed: {str(e)}")
 
 
 @app.get("/health")
