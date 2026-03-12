@@ -817,24 +817,47 @@ async def extract_cv(file: UploadFile = File(...)):
 
         prompt = f"""You are an expert CV parser specialized in French and English resumes.
 Extract structured data from the CV below and return ONLY a valid JSON object.
+Be EXHAUSTIVE — do not skip or truncate any section.
 
-=== LANGUAGE MAPPING (CRITICAL) ===
-Scan the ENTIRE CV for any section labeled: Langues, Languages, Compétences linguistiques,
-Langue parlées, Spoken languages, or similar.
-Extract EVERY language found — do not stop after 2, list ALL of them.
-Use these exact mappings:
-- Français / French / FR → "FRENCH"
-- Anglais / English / EN → "ENGLISH"
-- Arabe / Arabic / AR / العربية → "ARABIC"
-- Espagnol / Spanish → "SPANISH"
-- Allemand / German / Deutsch → "GERMAN"
-- Italien / Italian → "ITALIAN"
-- Portugais / Portuguese → "PORTUGUESE"
-- Chinois / Chinese / Mandarin → "CHINESE"
-- Japonais / Japanese → "JAPANESE"
-- Any other language → skip it, do not include it
-Allowed values ONLY: FRENCH, ENGLISH, ARABIC, SPANISH, GERMAN, ITALIAN, PORTUGUESE, CHINESE, JAPANESE
-Do NOT use "OTHER".
+=== BIO / PROFILE SUMMARY (CRITICAL) ===
+Look for a short personal introduction section. It may be labeled:
+French: Profil, À propos, A propos, Résumé, Resume, Présentation, Présentation professionnelle,
+  Synthèse, Synthèse professionnelle, Objectif, Objectif professionnel, Qui suis-je,
+  Introduction, Pitch, Accroche, Accroche professionnelle, Mon profil, Profil professionnel,
+  Résumé de profil, Description, Aperçu
+English: Profile, About, About me, Summary, Professional Summary, Career Summary,
+  Objective, Career Objective, Overview, Introduction, Personal Statement, Executive Summary
+If you find such a section, copy its full text as the bio value (2-4 sentences max).
+If no such section exists, return null for bio.
+IMPORTANT: Do NOT confuse bio with work experience descriptions. Bio is always at the TOP of the CV.
+
+=== WORK EXPERIENCE vs PROJECTS (CRITICAL) ===
+WORK EXPERIENCE = paid professional jobs at a company or client.
+  Indicators: company name, job title, dates of employment, salary, contract type.
+  Labels: Expérience professionnelle, Expériences, Experience, Work Experience, Employment, Parcours professionnel
+
+PROJECTS = personal, academic, freelance or open-source projects that are NOT paid employment.
+  Indicators: project name, technologies used, GitHub link, description of what was built.
+  Labels: Projets, Projets personnels, Projets académiques, Réalisations, Portfolio,
+          Projects, Personal Projects, Academic Projects, Side Projects, Open Source
+RULE: If an entry has a PROJECT NAME (not a job title) and/or a technology list but no company employer,
+put it in "projects", NOT in "workExperience".
+If projects section is empty or absent, return empty array [].
+
+=== SKILLS EXTRACTION (EXHAUSTIVE — CRITICAL) ===
+You MUST extract EVERY SINGLE skill listed in the CV. Do NOT stop early. Do NOT truncate.
+Search through ALL of these possible section labels:
+French: Compétences, Compétences techniques, Compétences informatiques, Technologies,
+  Technologies maîtrisées, Savoir-faire, Outils, Langages de programmation, Frameworks,
+  Environnement technique, Outils & Technologies, Stack technique, Compétences clés,
+  Logiciels, Maîtrise technique, Compétences métier, Hard skills, Soft skills,
+  Connaissances, Acquis techniques, Technologies utilisées, Langages & Frameworks
+English: Skills, Technical Skills, Technologies, Tools, Tech Stack, Key Skills,
+  Core Competencies, Programming Languages, Frameworks, Libraries, Platforms,
+  Hard Skills, Soft Skills, Expertise, Proficiencies, Technical Expertise
+Also extract skills mentioned inside work experience descriptions and project descriptions.
+Return each skill as a separate string. Include programming languages, frameworks, tools,
+methodologies (Agile, Scrum), databases, cloud platforms, and soft skills.
 
 === CERTIFICATIONS vs EDUCATION (CRITICAL) ===
 CERTIFICATIONS are professional credentials issued by tech or industry bodies:
@@ -846,32 +869,48 @@ EDUCATION is academic degrees from schools/universities:
 If certifications section is empty or absent, return empty array [].
 
 === DATE RULES ===
-- Format: YYYY-MM-DD. If only year: YYYY-01-01
+- Format: YYYY-MM-DD. If only year known: YYYY-01-01. If year+month: YYYY-MM-01.
 - French months: Janvier=01, Février=02, Mars=03, Avril=04, Mai=05, Juin=06,
   Juillet=07, Août=08, Septembre=09, Octobre=10, Novembre=11, Décembre=12
-- "Présent" / "Aujourd'hui" / "Current" / "En cours" → isCurrent: true, endDate: null
+- "Présent" / "Aujourd'hui" / "Current" / "En cours" / "Now" → isCurrent: true, endDate: null
+- If a date is missing or unknown → use null, never use empty string "".
 
-=== SKILLS EXTRACTION ===
-The skills section may be labeled differently in French or English CVs:
-French labels: Compétences, Compétences techniques, Compétences informatiques,
-  Technologies maîtrisées, Savoir-faire, Outils, Langages de programmation,
-  Frameworks, Environnement technique, Outils & Technologies, Stack technique,
-  Compétences clés, Logiciels, Maîtrise technique
-English labels: Skills, Technical Skills, Technologies, Tools, Tech Stack,
-  Key Skills, Core Competencies, Programming Languages, Frameworks
-Extract ALL technical and soft skills found in these sections.
+=== LANGUAGE MAPPING (CRITICAL) ===
+Scan the ENTIRE CV for any section labeled: Langues, Languages, Compétences linguistiques,
+Langues parlées, Spoken languages, or similar.
+Extract EVERY language found — do not stop after 2, list ALL of them.
+Use these exact mappings:
+- Français / French / FR → "FRENCH"
+- Anglais / English / EN → "ENGLISH"
+- Arabe / Arabic / AR / العربية → "ARABIC"
+- Espagnol / Spanish → "SPANISH"
+- Allemand / German / Deutsch → "GERMAN"
+- Italien / Italian → "ITALIAN"
+- Portugais / Portuguese → "PORTUGUESE"
+- Chinois / Chinese / Mandarin → "CHINESE"
+- Japonais / Japanese → "JAPANESE"
+- Any other language → skip it
+Allowed values ONLY: FRENCH, ENGLISH, ARABIC, SPANISH, GERMAN, ITALIAN, PORTUGUESE, CHINESE, JAPANESE
 
-=== JSON STRUCTURE ===
+=== JSON STRUCTURE (return exactly this structure) ===
 {{
-  "bio": "2-3 sentence professional summary, or null if no summary section exists",
+  "bio": "full profile/summary text from CV top section, or null",
   "workExperience": [
     {{
-      "jobTitle": "exact job title from CV",
-      "company": "company name",
-      "startDate": "YYYY-MM-DD",
-      "endDate": "YYYY-MM-DD or null if current",
+      "jobTitle": "exact job title",
+      "company": "company or client name",
+      "startDate": "YYYY-MM-DD or null",
+      "endDate": "YYYY-MM-DD or null",
       "isCurrent": false,
-      "description": "responsibilities and achievements, or empty string"
+      "description": "responsibilities and achievements"
+    }}
+  ],
+  "projects": [
+    {{
+      "name": "project name",
+      "description": "what was built, goals, outcomes",
+      "technologies": ["tech1", "tech2", "tech3"],
+      "url": "GitHub or project URL, or null"
     }}
   ],
   "education": [
@@ -879,23 +918,26 @@ Extract ALL technical and soft skills found in these sections.
       "diploma": "exact degree/diploma name",
       "institution": "school or university name",
       "year": 2020,
-      "description": "specialization or details, or empty string"
+      "description": "specialization or field of study, or empty string"
     }}
   ],
   "certifications": [
     {{
       "name": "exact certification name",
-      "issuer": "issuing organization (AWS, Microsoft, Cisco, etc.)",
+      "issuer": "issuing organization",
       "issueDate": "YYYY-MM-DD or null",
-      "expiryDate": null
+      "expiryDate": "YYYY-MM-DD or null"
     }}
   ],
-  "skills": ["skill1", "skill2", "skill3"],
-  "languages": ["FRENCH", "ENGLISH", "ARABIC", "GERMAN"]
+  "skills": ["skill1", "skill2", "skill3", "... ALL skills without exception"],
+  "languages": ["FRENCH", "ENGLISH"]
 }}
 
-IMPORTANT FOR LANGUAGES: Extract ALL languages listed in the CV, not just the first two.
-A CV can have 1, 2, 3, 4 or more languages. List every single one you find.
+FINAL REMINDER:
+- bio: look at the TOP of the CV for a Profil / À propos / Summary section
+- projects: any named project that is NOT a paid job goes here, NOT in workExperience
+- skills: include EVERY skill — do not truncate, do not stop at 10 or 20
+- dates: always null (never "") when unknown
 
 CV TEXT:
 {text}"""
@@ -927,6 +969,53 @@ CV TEXT:
         result = json.loads(json_str)
 
         # ── Post-validation : nettoyage des données extraites ─────────────────
+
+        # 0. Sanitisation des dates (évite les formats invalides → 400 côté Spring Boot)
+        def sanitize_date(value) -> str | None:
+            """Normalise une date extraite par le LLM en YYYY-MM-DD ou None."""
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text or text.lower() in ("null", "n/a", "unknown", "present",
+                                             "présent", "en cours", "aujourd'hui"):
+                return None
+            # Déjà au format YYYY-MM-DD
+            import re as _re
+            if _re.match(r'^\d{4}-\d{2}-\d{2}$', text):
+                # Vérifier que le mois et le jour sont valides
+                parts = text.split('-')
+                month, day = int(parts[1]), int(parts[2])
+                if month < 1: text = f"{parts[0]}-01-{parts[2]}"
+                if month > 12: text = f"{parts[0]}-12-{parts[2]}"
+                if day < 1: text = f"{parts[0]}-{parts[1]}-01"
+                if day > 31: text = f"{parts[0]}-{parts[1]}-01"
+                return text
+            # Format YYYY-MM
+            if _re.match(r'^\d{4}-\d{2}$', text):
+                return f"{text}-01"
+            # Année seule YYYY
+            if _re.match(r'^\d{4}$', text):
+                return f"{text}-01-01"
+            # Format DD/MM/YYYY ou MM/YYYY
+            if _re.match(r'^\d{2}/\d{2}/\d{4}$', text):
+                parts = text.split('/')
+                return f"{parts[2]}-{parts[1]}-{parts[0]}"
+            if _re.match(r'^\d{2}/\d{4}$', text):
+                parts = text.split('/')
+                return f"{parts[1]}-{parts[0]}-01"
+            # Impossible à parser → null (évite le 400)
+            print(f"[AI-EXTRACT] Unrecognized date format: '{text}' → null")
+            return None
+
+        # Nettoyer les dates dans workExperience
+        for exp in result.get("workExperience", []):
+            exp["startDate"] = sanitize_date(exp.get("startDate"))
+            exp["endDate"]   = sanitize_date(exp.get("endDate"))
+
+        # Nettoyer les dates dans certifications
+        for cert in result.get("certifications", []):
+            cert["issueDate"]  = sanitize_date(cert.get("issueDate"))
+            cert["expiryDate"] = sanitize_date(cert.get("expiryDate"))
 
         # 1. Filtrer les langues invalides (le LLM peut retourner "Français" au lieu de "FRENCH")
         VALID_LANGUAGES = {"FRENCH", "ENGLISH", "ARABIC", "SPANISH", "GERMAN",
@@ -969,7 +1058,7 @@ CV TEXT:
         # 2. Filtrer les certifications qui sont en réalité des diplômes académiques
         ACADEMIC_KEYWORDS = [
             "licence", "master", "doctorat", "ingénieur", "ingenieur", "bts", "dut",
-            "baccalauréat", "baccalaureat", "bachelor", "mba", "dut", "iut", "diplôme",
+            "baccalauréat", "baccalaureat", "bachelor", "mba", "iut", "diplôme",
             "diplome", "deug", "deust", "licence professionnelle", "magistère",
             "licence pro", "master pro", "master recherche"
         ]
@@ -983,10 +1072,67 @@ CV TEXT:
                 print(f"[AI-EXTRACT] Removed academic entry from certifications: {cert.get('name')}")
         result["certifications"] = cleaned_certifs
 
+        # 3. Séparer les projets mal classés dans workExperience
+        # Si une entrée workExperience n'a pas de "company" ou a une description de projet → déplacer
+        PROJECT_INDICATORS = ["github", "gitlab", "projet", "project", "application", "app",
+                               "portfolio", "open source", "personnel", "académique", "academic"]
+        work_cleaned = []
+        extra_projects = []
+        for exp in result.get("workExperience", []):
+            company = (exp.get("company") or "").strip()
+            job_title = (exp.get("jobTitle") or "").strip().lower()
+            desc = (exp.get("description") or "").lower()
+            # Indicateur : pas de company ET titre ressemble à un projet
+            if not company and any(ind in job_title or ind in desc for ind in PROJECT_INDICATORS):
+                # Convertir en projet
+                extra_projects.append({
+                    "name": exp.get("jobTitle", ""),
+                    "description": exp.get("description", ""),
+                    "technologies": [],
+                    "url": None,
+                })
+                print(f"[AI-EXTRACT] Moved from workExp to projects: {exp.get('jobTitle')}")
+            else:
+                work_cleaned.append(exp)
+        result["workExperience"] = work_cleaned
+
+        # Fusionner avec les projets déjà extraits
+        existing_projects = result.get("projects", [])
+        if not isinstance(existing_projects, list):
+            existing_projects = []
+        # Normaliser les projets (s'assurer que tous les champs existent)
+        all_projects = []
+        for proj in existing_projects + extra_projects:
+            all_projects.append({
+                "name":         proj.get("name", ""),
+                "description":  proj.get("description", ""),
+                "technologies": proj.get("technologies") if isinstance(proj.get("technologies"), list) else [],
+                "url":          proj.get("url") or None,
+            })
+        result["projects"] = all_projects
+
+        # 4. S'assurer que bio est null (pas "") si vide
+        if not result.get("bio") or str(result.get("bio", "")).strip() == "":
+            result["bio"] = None
+
+        # 5. Dédupliquer les skills
+        raw_skills = result.get("skills", [])
+        if isinstance(raw_skills, list):
+            seen = set()
+            deduped = []
+            for sk in raw_skills:
+                sk_norm = str(sk).strip()
+                if sk_norm and sk_norm.lower() not in seen:
+                    seen.add(sk_norm.lower())
+                    deduped.append(sk_norm)
+            result["skills"] = deduped
+
         print(f"[AI-EXTRACT] Final: {len(result.get('workExperience', []))} jobs, "
+              f"{len(result.get('projects', []))} projects, "
               f"{len(result.get('education', []))} edu, "
               f"{len(cleaned_certifs)} certifs, "
               f"{len(result.get('skills', []))} skills, "
+              f"bio={'yes' if result.get('bio') else 'no'}, "
               f"languages={result.get('languages', [])}")
 
         return result
@@ -999,6 +1145,199 @@ CV TEXT:
     except Exception as e:
         print(f"[AI-EXTRACT] Error: {e}")
         raise HTTPException(status_code=500, detail=f"CV extraction failed: {str(e)}")
+
+
+
+# ── Mission Matching ──────────────────────────────────────────────────────────
+
+class WorkExperienceItem(BaseModel):
+    jobTitle: Optional[str] = ""
+    company: Optional[str] = ""
+    description: Optional[str] = ""
+    isCurrent: Optional[bool] = False
+
+class ProjectItem(BaseModel):
+    name: Optional[str] = ""
+    description: Optional[str] = ""
+    technologies: Optional[List[str]] = []
+
+class MatchMissionRequest(BaseModel):
+    freelancerSkills: Optional[List[str]] = []
+    freelancerBio: Optional[str] = ""
+    freelancerPosition: Optional[str] = ""
+    freelancerExperience: Optional[int] = None
+    workExperience: Optional[List[WorkExperienceItem]] = []
+    projects: Optional[List[ProjectItem]] = []
+    missionTitle: Optional[str] = ""
+    missionDescription: Optional[str] = ""
+    missionRequiredSkills: Optional[str] = ""
+    missionTechnicalEnvironment: Optional[str] = ""
+
+class MatchMissionResponse(BaseModel):
+    score: int
+    skillScore: int
+    semanticScore: int
+    matchedSkills: List[str]
+    missingSkills: List[str]
+    recommendation: str
+    explanation: str
+
+
+@app.post("/match-mission", response_model=MatchMissionResponse)
+def match_mission(req: MatchMissionRequest):
+    """
+    Calcule la compatibilité entre un freelancer et une mission.
+    Retourne un score (0-100), les compétences matchées/manquantes et une recommandation.
+    """
+    try:
+        print("[MATCH] Starting mission matching...")
+
+        # ── 1. Skill Match Score ──────────────────────────────────────────────
+        raw_required = strip_html(req.missionRequiredSkills or "")
+        required_skills = [s.strip() for s in re.split(r'[,;|\n]+', raw_required) if s.strip()]
+
+        freelancer_skills_norm = [normalize(s) for s in (req.freelancerSkills or [])]
+        required_skills_norm = [normalize(s) for s in required_skills]
+
+        matched_skills = []
+        missing_skills = []
+
+        for i, req_skill_norm in enumerate(required_skills_norm):
+            original = required_skills[i] if i < len(required_skills) else req_skill_norm
+            found = False
+            for fl_skill_norm in freelancer_skills_norm:
+                # Exact match ou substring match (ex: "React" dans "ReactJS")
+                if req_skill_norm in fl_skill_norm or fl_skill_norm in req_skill_norm:
+                    found = True
+                    break
+            if found:
+                matched_skills.append(original)
+            else:
+                missing_skills.append(original)
+
+        skill_score = int((len(matched_skills) / len(required_skills)) * 100) if required_skills else 0
+        print(f"[MATCH] Skill score: {skill_score}% ({len(matched_skills)}/{len(required_skills)})")
+
+        # ── 2. Semantic Similarity Score ──────────────────────────────────────
+        # Construire texte CV du freelancer
+        exp_parts = []
+        for we in (req.workExperience or [])[:3]:
+            if we.jobTitle or we.company:
+                part = f"{we.jobTitle or ''} at {we.company or ''}".strip()
+                if we.description:
+                    part += f": {we.description[:200]}"
+                exp_parts.append(part)
+
+        proj_parts = []
+        for p in (req.projects or [])[:3]:
+            if p.name:
+                tech_str = ", ".join(p.technologies or [])
+                part = f"{p.name}: {p.description or ''} ({tech_str})"
+                proj_parts.append(part[:200])
+
+        cv_text = " | ".join(filter(None, [
+            req.freelancerPosition or "",
+            req.freelancerBio or "",
+            "Compétences: " + ", ".join(req.freelancerSkills or []),
+            "Expérience: " + " | ".join(exp_parts),
+            "Projets: " + " | ".join(proj_parts),
+        ]))
+
+        # Construire texte Mission
+        mission_text = " | ".join(filter(None, [
+            req.missionTitle or "",
+            req.missionDescription or "",
+            "Compétences requises: " + (req.missionRequiredSkills or ""),
+            "Environnement technique: " + (req.missionTechnicalEnvironment or ""),
+        ]))
+
+        cv_vec = model.encode(cv_text, normalize_embeddings=True)
+        mission_vec = model.encode(mission_text, normalize_embeddings=True)
+        semantic_sim = float(np.dot(cv_vec, mission_vec))  # cosine sim (vecteurs normalisés)
+        semantic_score = int(max(0, min(100, semantic_sim * 100)))
+        print(f"[MATCH] Semantic score: {semantic_score}%")
+
+        # ── 3. Score final ────────────────────────────────────────────────────
+        final_score = int(round(0.55 * skill_score + 0.45 * semantic_score))
+        final_score = max(0, min(100, final_score))
+        print(f"[MATCH] Final score: {final_score}%")
+
+        # ── 4. LLM Recommendation via llama3.2 ───────────────────────────────
+        matched_str = ", ".join(matched_skills) if matched_skills else "aucune"
+        missing_str = ", ".join(missing_skills[:8]) if missing_skills else "aucune"
+        skills_str = ", ".join((req.freelancerSkills or [])[:15])
+        exp_str = f"{req.freelancerExperience} ans" if req.freelancerExperience is not None else "non précisée"
+
+        llm_prompt = f"""You are an expert tech recruiter. Analyze the compatibility between this freelancer and this job mission.
+
+FREELANCER:
+- Current position: {req.freelancerPosition or 'not specified'}
+- Experience: {exp_str}
+- Skills: {skills_str}
+- Bio: {(req.freelancerBio or '')[:300]}
+
+MISSION: {req.missionTitle or 'not specified'}
+- Description: {(req.missionDescription or '')[:400]}
+- Required skills: {raw_required[:300]}
+
+PRE-CALCULATED ANALYSIS:
+- Compatibility score: {final_score}%
+- Matched skills ({len(matched_skills)}): {matched_str}
+- Missing skills ({len(missing_skills)}): {missing_str}
+
+Reply ONLY with valid JSON (no text before or after) with exactly these 2 fields:
+{{
+  "recommendation": "APPLY" or "APPLY WITH RESERVATIONS" or "DO NOT APPLY",
+  "explanation": "2-3 sentences maximum explaining why, in English, concise and direct"
+}}"""
+
+        try:
+            response = ollama.chat(
+                model='llama3.2',
+                messages=[{'role': 'user', 'content': llm_prompt}],
+                options={"temperature": 0.1}
+            )
+            raw = response['message']['content'].strip()
+            # Extraire le JSON
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if json_match:
+                llm_data = json.loads(json_match.group())
+                recommendation = llm_data.get("recommendation", "").strip().upper()
+                explanation = llm_data.get("explanation", "").strip()
+                # Valider la recommendation
+                valid_recs = ["APPLY", "APPLY WITH RESERVATIONS", "DO NOT APPLY"]
+                if recommendation not in valid_recs:
+                    recommendation = "APPLY" if final_score >= 60 else ("APPLY WITH RESERVATIONS" if final_score >= 40 else "DO NOT APPLY")
+            else:
+                raise ValueError("No JSON found in LLM response")
+        except Exception as llm_err:
+            print(f"[MATCH] LLM error (using fallback): {llm_err}")
+            # Fallback basé sur le score
+            if final_score >= 65:
+                recommendation = "APPLY"
+                explanation = f"Your profile is a strong match for this mission with {final_score}% compatibility. You have {len(matched_skills)} out of {len(required_skills)} required skills."
+            elif final_score >= 40:
+                recommendation = "APPLY WITH RESERVATIONS"
+                explanation = f"Your profile is a partial match ({final_score}%). Some key skills are missing: {missing_str[:100]}."
+            else:
+                recommendation = "DO NOT APPLY"
+                explanation = f"Your profile does not sufficiently match this mission ({final_score}%). Too many required skills are absent from your profile."
+
+        print(f"[MATCH] Recommendation: {recommendation}")
+
+        return MatchMissionResponse(
+            score=final_score,
+            skillScore=skill_score,
+            semanticScore=semantic_score,
+            matchedSkills=matched_skills,
+            missingSkills=missing_skills,
+            recommendation=recommendation,
+            explanation=explanation,
+        )
+
+    except Exception as e:
+        print(f"[MATCH] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Matching failed: {str(e)}")
 
 
 @app.get("/health")
