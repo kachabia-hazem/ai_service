@@ -815,9 +815,12 @@ async def extract_cv(file: UploadFile = File(...)):
 
         print(f"[AI-EXTRACT] Extracted {len(text)} chars from PDF")
 
-        prompt = f"""You are an expert CV parser specialized in French and English resumes.
-Extract structured data from the CV below and return ONLY a valid JSON object.
-Be EXHAUSTIVE — do not skip or truncate any section.
+        prompt = f"""You are a CV data extractor. Your ONLY job is to copy information that EXPLICITLY appears in the CV text below.
+STRICT RULES — violation is not allowed:
+1. NEVER invent, infer, guess, complete, or add ANY information not present word-for-word in the CV.
+2. If a field is absent from the CV, return null (for strings/objects) or [] (for arrays). NEVER fabricate a value.
+3. Copy text EXACTLY as written in the CV — do not paraphrase, summarize, or rewrite.
+4. Return ONLY a valid JSON object, no text before or after.
 
 === BIO / PROFILE SUMMARY (CRITICAL) ===
 Look for a short personal introduction section. It may be labeled:
@@ -827,7 +830,7 @@ French: Profil, À propos, A propos, Résumé, Resume, Présentation, Présentat
   Résumé de profil, Description, Aperçu
 English: Profile, About, About me, Summary, Professional Summary, Career Summary,
   Objective, Career Objective, Overview, Introduction, Personal Statement, Executive Summary
-If you find such a section, copy its full text as the bio value (2-4 sentences max).
+If you find such a section, copy its FULL EXACT text as the bio value — do NOT shorten or summarize it.
 If no such section exists, return null for bio.
 IMPORTANT: Do NOT confuse bio with work experience descriptions. Bio is always at the TOP of the CV.
 
@@ -856,8 +859,8 @@ English: Skills, Technical Skills, Technologies, Tools, Tech Stack, Key Skills,
   Core Competencies, Programming Languages, Frameworks, Libraries, Platforms,
   Hard Skills, Soft Skills, Expertise, Proficiencies, Technical Expertise
 Also extract skills mentioned inside work experience descriptions and project descriptions.
-Return each skill as a separate string. Include programming languages, frameworks, tools,
-methodologies (Agile, Scrum), databases, cloud platforms, and soft skills.
+Return each skill as a separate string EXACTLY as written in the CV.
+Do NOT add skills that are not explicitly written in the CV.
 
 === CERTIFICATIONS vs EDUCATION (CRITICAL) ===
 CERTIFICATIONS are professional credentials issued by tech or industry bodies:
@@ -934,10 +937,11 @@ Allowed values ONLY: FRENCH, ENGLISH, ARABIC, SPANISH, GERMAN, ITALIAN, PORTUGUE
 }}
 
 FINAL REMINDER:
-- bio: look at the TOP of the CV for a Profil / À propos / Summary section
+- NEVER invent or guess any data — if it is not written in the CV, return null or []
+- bio: copy EXACTLY the text from the Profil / À propos / Summary section at the TOP
 - projects: any named project that is NOT a paid job goes here, NOT in workExperience
-- skills: include EVERY skill — do not truncate, do not stop at 10 or 20
-- dates: always null (never "") when unknown
+- skills: copy EVERY skill EXACTLY as written — do not add, do not skip
+- dates: always null (never "") when not explicitly written in the CV
 
 CV TEXT:
 {text}"""
@@ -946,7 +950,11 @@ CV TEXT:
             model='llama3.2',
             messages=[{'role': 'user', 'content': prompt}],
             format='json',
-            options={'temperature': 0.1}
+            options={
+                'temperature': 0,
+                'seed': 42,
+                'num_ctx': 4096,
+            }
         )
 
         # Compatible avec ollama >= 0.2.x (objet Pydantic) et < 0.2.x (dict)
@@ -1338,6 +1346,157 @@ Reply ONLY with valid JSON (no text before or after) with exactly these 2 fields
     except Exception as e:
         print(f"[MATCH] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Matching failed: {str(e)}")
+
+
+# ── Rank Candidates ───────────────────────────────────────────────────────────
+
+class CandidateProfile(BaseModel):
+    applicationId: str
+    freelancerId: str
+    skills: Optional[List[str]] = []
+    bio: Optional[str] = ""
+    currentPosition: Optional[str] = ""
+    yearsOfExperience: Optional[int] = None
+    profileTypes: Optional[List[str]] = []
+    workExperience: Optional[List[dict]] = []
+    projects: Optional[List[dict]] = []
+    certifications: Optional[List[dict]] = []
+    education: Optional[List[dict]] = []
+    rating: Optional[float] = None
+    portfolioUrl: Optional[str] = None
+    cvUrl: Optional[str] = None
+
+
+class RankCandidatesRequest(BaseModel):
+    missionId: str
+    missionTitle: Optional[str] = ""
+    missionDescription: Optional[str] = ""
+    missionRequiredSkills: Optional[str] = ""
+    missionTechnicalEnvironment: Optional[str] = ""
+    missionYearsOfExperience: Optional[int] = None
+    candidates: List[CandidateProfile]
+
+
+class CandidateRankResult(BaseModel):
+    applicationId: str
+    freelancerId: str
+    rank: int
+    totalScore: float
+    skillScore: float
+    experienceScore: float
+    semanticScore: float
+    completenessScore: float
+    matchedSkills: List[str]
+    missingSkills: List[str]
+
+
+@app.post("/rank-candidates", response_model=List[CandidateRankResult])
+def rank_candidates(req: RankCandidatesRequest):
+    """Classe les candidats d'une mission par score AI (skills + expérience + sémantique + complétude)."""
+    if not req.candidates:
+        return []
+
+    # Encoder le texte mission une seule fois
+    mission_text = " | ".join(filter(None, [
+        req.missionTitle or "",
+        req.missionDescription or "",
+        req.missionRequiredSkills or "",
+        req.missionTechnicalEnvironment or "",
+    ]))
+    mission_vec = model.encode(mission_text, normalize_embeddings=True)
+
+    # Parser les skills requis (requiredSkills + technicalEnvironment)
+    raw_required = strip_html(req.missionRequiredSkills or "") + " " + strip_html(req.missionTechnicalEnvironment or "")
+    required_skills = [s.strip() for s in re.split(r'[,;|\n]+', raw_required) if s.strip()]
+    required_skills_norm = [normalize(s) for s in required_skills]
+
+    results = []
+
+    for candidate in req.candidates:
+
+        # ── 1. Skill Score (40%) ──────────────────────────────────────────────
+        freelancer_skills_norm = [normalize(s) for s in (candidate.skills or [])]
+        matched, missing = [], []
+        for i, req_norm in enumerate(required_skills_norm):
+            original = required_skills[i] if i < len(required_skills) else req_norm
+            found = any(req_norm in fs or fs in req_norm for fs in freelancer_skills_norm)
+            (matched if found else missing).append(original)
+        skill_score = (len(matched) / len(required_skills) * 100) if required_skills else 50.0
+
+        # ── 2. Experience Score (25%) ─────────────────────────────────────────
+        required_exp = req.missionYearsOfExperience or 0
+        candidate_exp = candidate.yearsOfExperience or 0
+        if required_exp == 0:
+            experience_score = 100.0
+        elif candidate_exp >= required_exp:
+            experience_score = min(100.0, 100.0 + (candidate_exp - required_exp) * 5)
+        else:
+            experience_score = max(0.0, (candidate_exp / required_exp) * 100)
+
+        # ── 3. Semantic Score (25%) ───────────────────────────────────────────
+        exp_parts = []
+        for we in (candidate.workExperience or [])[:3]:
+            title = we.get("jobTitle", "") or ""
+            company = we.get("company", "") or ""
+            desc = (we.get("description", "") or "")[:150]
+            exp_parts.append(f"{title} at {company}: {desc}")
+
+        proj_parts = []
+        for p in (candidate.projects or [])[:3]:
+            techs = ", ".join(p.get("technologies", []) or [])
+            proj_parts.append(f"{p.get('name','')}: {(p.get('description','') or '')[:100]} ({techs})")
+
+        cv_text = " | ".join(filter(None, [
+            candidate.currentPosition or "",
+            candidate.bio or "",
+            "Skills: " + ", ".join(candidate.skills or []),
+            " | ".join(exp_parts),
+            " | ".join(proj_parts),
+        ]))
+        cv_vec = model.encode(cv_text, normalize_embeddings=True)
+        semantic_score = float(np.dot(cv_vec, mission_vec)) * 100
+        semantic_score = max(0.0, min(100.0, semantic_score))
+
+        # ── 4. Complétude profil (10%) ────────────────────────────────────────
+        completeness = 0.0
+        if candidate.bio and len((candidate.bio or "").strip()) > 20:   completeness += 20
+        if candidate.certifications:                                      completeness += 15
+        if candidate.workExperience:                                      completeness += 20
+        if candidate.projects:                                            completeness += 15
+        if candidate.education:                                           completeness += 10
+        if candidate.portfolioUrl:                                        completeness += 10
+        if candidate.cvUrl:                                               completeness += 5
+        if candidate.rating and candidate.rating >= 4.0:                 completeness += 5
+
+        # ── Score final pondéré ───────────────────────────────────────────────
+        total = round(
+            0.40 * skill_score +
+            0.25 * experience_score +
+            0.25 * semantic_score +
+            0.10 * completeness,
+            1
+        )
+
+        results.append(CandidateRankResult(
+            applicationId=candidate.applicationId,
+            freelancerId=candidate.freelancerId,
+            rank=0,
+            totalScore=total,
+            skillScore=round(skill_score, 1),
+            experienceScore=round(experience_score, 1),
+            semanticScore=round(semantic_score, 1),
+            completenessScore=round(completeness, 1),
+            matchedSkills=matched,
+            missingSkills=missing,
+        ))
+
+    # Trier par score décroissant et assigner les rangs
+    results.sort(key=lambda x: x.totalScore, reverse=True)
+    for i, r in enumerate(results):
+        r.rank = i + 1
+
+    print(f"[RANK] Mission {req.missionId}: {len(results)} candidates ranked, best={results[0].totalScore}%")
+    return results
 
 
 @app.get("/health")
