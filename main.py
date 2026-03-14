@@ -1348,6 +1348,108 @@ Reply ONLY with valid JSON (no text before or after) with exactly these 2 fields
         raise HTTPException(status_code=500, detail=f"Matching failed: {str(e)}")
 
 
+@app.post("/match-mission-quick", response_model=MatchMissionResponse)
+def match_mission_quick(req: MatchMissionRequest):
+    """
+    Version rapide sans LLM : skill matching + semantic similarity uniquement.
+    Retourne les résultats en ~1-2 secondes avec une recommandation basée sur les scores.
+    """
+    try:
+        print("[MATCH-QUICK] Starting fast mission matching...")
+
+        # ── 1. Skill Match Score ──────────────────────────────────────────────
+        raw_required = strip_html(req.missionRequiredSkills or "")
+        required_skills = [s.strip() for s in re.split(r'[,;|\n]+', raw_required) if s.strip()]
+
+        freelancer_skills_norm = [normalize(s) for s in (req.freelancerSkills or [])]
+        required_skills_norm = [normalize(s) for s in required_skills]
+
+        matched_skills = []
+        missing_skills = []
+
+        for i, req_skill_norm in enumerate(required_skills_norm):
+            original = required_skills[i] if i < len(required_skills) else req_skill_norm
+            found = False
+            for fl_skill_norm in freelancer_skills_norm:
+                if req_skill_norm in fl_skill_norm or fl_skill_norm in req_skill_norm:
+                    found = True
+                    break
+            if found:
+                matched_skills.append(original)
+            else:
+                missing_skills.append(original)
+
+        skill_score = int((len(matched_skills) / len(required_skills)) * 100) if required_skills else 0
+
+        # ── 2. Semantic Similarity Score ──────────────────────────────────────
+        exp_parts = []
+        for we in (req.workExperience or [])[:3]:
+            if we.jobTitle or we.company:
+                part = f"{we.jobTitle or ''} at {we.company or ''}".strip()
+                if we.description:
+                    part += f": {we.description[:200]}"
+                exp_parts.append(part)
+
+        proj_parts = []
+        for p in (req.projects or [])[:3]:
+            if p.name:
+                tech_str = ", ".join(p.technologies or [])
+                part = f"{p.name}: {p.description or ''} ({tech_str})"
+                proj_parts.append(part[:200])
+
+        cv_text = " | ".join(filter(None, [
+            req.freelancerPosition or "",
+            req.freelancerBio or "",
+            "Compétences: " + ", ".join(req.freelancerSkills or []),
+            "Expérience: " + " | ".join(exp_parts),
+            "Projets: " + " | ".join(proj_parts),
+        ]))
+
+        mission_text = " | ".join(filter(None, [
+            req.missionTitle or "",
+            req.missionDescription or "",
+            "Compétences requises: " + (req.missionRequiredSkills or ""),
+            "Environnement technique: " + (req.missionTechnicalEnvironment or ""),
+        ]))
+
+        cv_vec = model.encode(cv_text, normalize_embeddings=True)
+        mission_vec = model.encode(mission_text, normalize_embeddings=True)
+        semantic_sim = float(np.dot(cv_vec, mission_vec))
+        semantic_score = int(max(0, min(100, semantic_sim * 100)))
+
+        # ── 3. Score final ────────────────────────────────────────────────────
+        final_score = int(round(0.55 * skill_score + 0.45 * semantic_score))
+        final_score = max(0, min(100, final_score))
+
+        # ── 4. Recommandation basée sur les scores (sans LLM) ─────────────────
+        missing_str = ", ".join(missing_skills[:8]) if missing_skills else "none"
+        if final_score >= 65:
+            recommendation = "APPLY"
+            explanation = f"Your profile is a strong match for this mission with {final_score}% compatibility. You have {len(matched_skills)} out of {len(required_skills)} required skills."
+        elif final_score >= 40:
+            recommendation = "APPLY WITH RESERVATIONS"
+            explanation = f"Your profile is a partial match ({final_score}%). Some key skills are missing: {missing_str[:100]}."
+        else:
+            recommendation = "DO NOT APPLY"
+            explanation = f"Your profile does not sufficiently match this mission ({final_score}%). Too many required skills are absent from your profile."
+
+        print(f"[MATCH-QUICK] Done. Score: {final_score}%, Recommendation: {recommendation}")
+
+        return MatchMissionResponse(
+            score=final_score,
+            skillScore=skill_score,
+            semanticScore=semantic_score,
+            matchedSkills=matched_skills,
+            missingSkills=missing_skills,
+            recommendation=recommendation,
+            explanation=explanation,
+        )
+
+    except Exception as e:
+        print(f"[MATCH-QUICK] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Quick matching failed: {str(e)}")
+
+
 # ── Rank Candidates ───────────────────────────────────────────────────────────
 
 class CandidateProfile(BaseModel):
