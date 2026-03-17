@@ -707,10 +707,12 @@ def search_missions(req: SearchRequest):
         candidates = full_match + partial_match
         print(f"[AI] Multi-filter [{all_filters}]: {len(full_match)} full, {len(partial_match)} partial")
 
-    results = [
-        SearchResult(mission_id=mid, score=round(s * 100, 1))
-        for mid, s in candidates
-    ]
+    seen_ids = set()
+    results = []
+    for mid, s in candidates:
+        if mid not in seen_ids:
+            seen_ids.add(mid)
+            results.append(SearchResult(mission_id=mid, score=round(s * 100, 1)))
 
     mode = f"CITY={detected_cities}" if detected_cities else ("LOCATION" if location_query else "SEMANTIC")
     print(f"[AI] Search [{mode}]: '{req.prompt}' → {len(results)} results "
@@ -780,11 +782,12 @@ def search_freelancers(req: SearchRequest):
     dynamic_ratio = 0.50 if location_query else 0.60
     dynamic_threshold = max(ABSOLUTE_MIN, best_score * dynamic_ratio)
 
-    results = [
-        FreelancerSearchResult(freelancer_id=fid, score=round(s * 100, 1))
-        for fid, s in candidates
-        if s >= dynamic_threshold
-    ]
+    seen_fids = set()
+    results = []
+    for fid, s in candidates:
+        if s >= dynamic_threshold and fid not in seen_fids:
+            seen_fids.add(fid)
+            results.append(FreelancerSearchResult(freelancer_id=fid, score=round(s * 100, 1)))
 
     mode = f"CITY={detected_cities}" if detected_cities else ("LOCATION" if location_query else "SEMANTIC")
     print(f"[AI] Freelancer search [{mode}]: '{req.prompt}' → {len(results)} results "
@@ -1599,6 +1602,95 @@ def rank_candidates(req: RankCandidatesRequest):
 
     print(f"[RANK] Mission {req.missionId}: {len(results)} candidates ranked, best={results[0].totalScore}%")
     return results
+
+
+@app.post("/recommend-missions", response_model=List[SearchResult])
+def recommend_missions(req: FreelancerIndexRequest):
+    """
+    Recommande uniquement les missions vraiment compatibles avec le profil freelancer.
+    Score combiné : 55% skills match + 45% similarité sémantique.
+    Filtre strict : score combiné >= 42 ET au moins 1 skill correspondant.
+    """
+    if len(mission_ids) == 0:
+        return []
+
+    # ── 1. Premier passage FAISS — top 20 candidats sémantiques ──────────────
+    profile_text = freelancer_to_text(req)
+    query_vec = model.encode(profile_text, normalize_embeddings=True)
+    query_vec = np.array([query_vec], dtype=np.float32)
+
+    k = min(20, len(mission_ids))
+    faiss_scores, faiss_indices = index.search(query_vec, k)
+
+    # Seuil sémantique de base (élimine les missions vraiment hors sujet)
+    SEMANTIC_MIN = 0.22
+    candidates = [
+        (mission_ids[idx], float(score))
+        for score, idx in zip(faiss_scores[0], faiss_indices[0])
+        if idx >= 0 and float(score) >= SEMANTIC_MIN
+    ]
+
+    if not candidates:
+        print(f"[AI] Recommend: freelancer {req.id} → 0 results (semantic filter)")
+        return []
+
+    # ── 2. Skill matching sur chaque candidat ────────────────────────────────
+    freelancer_skills_norm = [normalize(s) for s in (req.skills or [])]
+    position_norm = normalize(req.currentPosition or "")
+    # Élargir avec le poste (ex: "angular developer" → skills angular, typescript…)
+    expanded_position = normalize(expand_prompt(req.currentPosition or ""))
+
+    results = []
+    for mid, sem_score in candidates:
+        meta = mission_metadata.get(mid, {})
+        content_norm = meta.get("content_norm", "")
+
+        # Compter les skills du freelancer présents dans la mission
+        matched = 0
+        for skill_norm in freelancer_skills_norm:
+            if skill_norm and (skill_norm in content_norm):
+                matched += 1
+            else:
+                # Chercher aussi via les synonymes du dictionnaire d'expansion
+                for syn in DOMAIN_EXPANSION.get(skill_norm, []):
+                    if normalize(syn) in content_norm:
+                        matched += 1
+                        break
+
+        total_skills = max(len(freelancer_skills_norm), 1)
+        skill_score = (matched / total_skills) * 100
+
+        # Bonus si le titre de poste matche le contenu de la mission
+        if position_norm and position_norm in content_norm:
+            skill_score = min(100, skill_score + 15)
+        elif any(term in content_norm for term in expanded_position.split()[:8] if len(term) > 3):
+            skill_score = min(100, skill_score + 8)
+
+        # Score combiné
+        sem_pct = sem_score * 100
+        combined = round(0.55 * skill_score + 0.45 * sem_pct, 1)
+
+        # Filtre strict : score combiné >= 42 ET au moins 1 skill ou position match
+        has_skill_match = matched > 0 or (position_norm and position_norm in content_norm)
+        if combined >= 42 and has_skill_match:
+            results.append((mid, combined))
+
+    if not results:
+        print(f"[AI] Recommend: freelancer {req.id} → 0 results after skill filter")
+        return []
+
+    # ── 3. Dédupliquer (même mission indexée 2x), trier, top 8 ─────────────
+    seen = set()
+    unique_results = []
+    for mid, score in sorted(results, key=lambda x: x[1], reverse=True):
+        if mid not in seen:
+            seen.add(mid)
+            unique_results.append((mid, score))
+    results = unique_results[:8]
+
+    print(f"[AI] Recommend: freelancer {req.id} → {len(results)} compatible missions "
+          f"(best={results[0][1]}%)")
+    return [SearchResult(mission_id=mid, score=score) for mid, score in results]
 
 
 @app.get("/health")
