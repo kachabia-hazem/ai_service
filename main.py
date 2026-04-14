@@ -246,6 +246,91 @@ JOB_TYPE_MAP = {
     "teletravail":   ["remote", "teletravail", "a distance", "distanciel"],
 }
 
+# ── Détection de requêtes hors-sujet ─────────────────────────────────────────
+#
+# Logique en 2 niveaux :
+#   1. La requête doit contenir AU MOINS UN mot TECHNIQUE IT (technologie,
+#      langage, métier IT précis, ville, type de contrat...).
+#   2. Les mots génériques comme "freelancer", "mission", "poste" seuls
+#      ne suffisent PAS — ils ne prouvent pas que la recherche est IT.
+#
+# Ex: "je veux un freelancer qui maîtrise le biceps"
+#   → "freelancer" seul : non-technique → REJETÉ ✓
+# Ex: "je cherche un développeur Angular à Tunis"
+#   → "developpeur" + "angular" + "tunis" : techniques → ACCEPTÉ ✓
+
+# Mots techniques stricts — suffisants seuls pour valider la requête
+_TECH_KEYWORDS = (
+    set(DOMAIN_EXPANSION.keys()) |   # angular, react, java, python, docker...
+    set(JOB_TYPE_MAP.keys()) |        # full time, freelance, stage, cdi...
+    CITY_KEYWORDS | REMOTE_KEYWORDS | # nabeul, tunis, sousse... / remote, teletravail
+    {
+        # Métiers IT précis (pas "manager" ou "gestionnaire" seuls)
+        "developpeur", "developer", "ingenieur", "engineer",
+        "technicien", "programmeur", "analyste", "analyst",
+        "administrateur", "testeur", "tester", "architecte",
+        "devops", "sysadmin", "scrum",
+        # Domaine IT non-ambigu
+        "informatique", "logiciel", "software", "hardware",
+        "web", "application", "code", "api", "microservice",
+        "framework", "librairie", "database", "serveur", "server",
+        "cloud", "linux", "github", "gitlab", "programmation",
+        "developpement", "development", "coding",
+        # Données / IA
+        "intelligence", "artificielle", "machine", "learning",
+        "statistiques", "python", "nosql",
+        # Design IT
+        "design", "maquette", "prototype", "wireframe", "figma",
+        # Contexte
+        "tunisie", "tunisia", "teletravail",
+        # Niveaux d'expérience (valides si accompagnés d'autre chose,
+        # mais ne suffisent pas seuls — traités en bonus uniquement)
+    }
+)
+
+# Mots qui NE SUFFISENT PAS seuls (trop génériques)
+# Si la requête ne contient QUE ces mots → hors-sujet
+_WEAK_KEYWORDS = {
+    "freelancer", "freelance", "mission", "poste", "emploi", "offre",
+    "profil", "recrutement", "embauche", "candidat", "contrat",
+    "junior", "senior", "confirme", "experimente", "consultant",
+    "stage", "alternance", "internship", "competence", "skill",
+    "experience", "projet", "travail", "job",
+}
+
+# Precompile word-boundary patterns
+_TECH_PATTERNS = [
+    re.compile(r'(?<![a-z])' + re.escape(kw) + r'(?![a-z])')
+    for kw in _TECH_KEYWORDS
+]
+_WEAK_PATTERNS = [
+    re.compile(r'(?<![a-z])' + re.escape(kw) + r'(?![a-z])')
+    for kw in _WEAK_KEYWORDS
+]
+
+
+def is_off_topic(prompt_norm: str) -> bool:
+    """
+    Retourne True si la requête est hors-sujet IT/freelance.
+
+    Règle :
+    - La requête est valide si elle contient au moins un mot TECHNIQUE IT.
+    - Les mots génériques ("freelancer", "mission", "poste"...) seuls
+      ne suffisent pas — la requête doit aussi contenir un mot technique.
+    """
+    has_tech  = any(p.search(prompt_norm) for p in _TECH_PATTERNS)
+    has_weak  = any(p.search(prompt_norm) for p in _WEAK_PATTERNS)
+
+    if has_tech:
+        return False   # contient un vrai mot technique → valide
+
+    if has_weak:
+        # Contient seulement des mots génériques ("freelancer biceps") → hors-sujet
+        return True
+
+    return True  # aucun mot connu → hors-sujet
+
+
 # Clés de DOMAIN_EXPANSION à exclure du filtrage compétences (non-tech)
 _NON_SKILL_KEYS = (
     CITY_KEYWORDS | REMOTE_KEYWORDS |
@@ -649,6 +734,17 @@ def search_missions(req: SearchRequest):
         return []
 
     prompt_norm = normalize(req.prompt)
+
+    # Rejeter les requêtes hors domaine IT/freelance
+    if is_off_topic(prompt_norm):
+        print(f"[AI] OFF-TOPIC rejected: '{req.prompt}'")
+        raise HTTPException(
+            status_code=422,
+            detail="Votre recherche semble hors du contexte de la plateforme. "
+                   "Veuillez rechercher des compétences IT, des postes ou des technologies "
+                   "(ex: développeur Angular, Java senior, Data Scientist à Tunis...)."
+        )
+
     location_query = is_location_query(prompt_norm)
 
     enriched_prompt = expand_prompt(req.prompt)
@@ -744,6 +840,17 @@ def search_freelancers(req: SearchRequest):
         return []
 
     prompt_norm = normalize(req.prompt)
+
+    # Rejeter les requêtes hors domaine IT/freelance
+    if is_off_topic(prompt_norm):
+        print(f"[AI] OFF-TOPIC rejected: '{req.prompt}'")
+        raise HTTPException(
+            status_code=422,
+            detail="Votre recherche semble hors du contexte de la plateforme. "
+                   "Veuillez rechercher des compétences IT, des postes ou des technologies "
+                   "(ex: développeur React, ingénieur DevOps, Data Analyst junior...)."
+        )
+
     location_query = is_location_query(prompt_norm)
 
     enriched_prompt = expand_prompt(req.prompt)
