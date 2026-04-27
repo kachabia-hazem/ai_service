@@ -11,6 +11,12 @@ import pdfplumber
 import ollama
 import json
 import io
+import ssl
+import socket
+import datetime
+import time
+import requests
+from bs4 import BeautifulSoup
 
 from sentence_transformers import SentenceTransformer
 import faiss
@@ -1808,3 +1814,682 @@ def health():
         "indexed_freelancers": len(freelancer_ids),
         "model": "paraphrase-multilingual-MiniLM-L12-v2"
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPANY TRUST SCORE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Domaines d'email considérés comme génériques (non professionnels)
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMPANY TRUST SCORE — 3-Node AI Workflow
+#  Node 1 : Website + Domain Age + Social Media (python-whois + requests + BS4)
+#  Node 2 : Email Validation + Matching       (email-validator + regex)
+#  Node 3 : AI Scoring                        (Ollama llama3.2 + rule fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+
+GENERIC_EMAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com",
+    "mail.com", "icloud.com", "aol.com", "yandex.com", "protonmail.com",
+    "tutanota.com", "inbox.com", "gmx.com", "zoho.com", "yahoo.fr",
+    "hotmail.fr", "orange.fr", "free.fr", "sfr.fr", "laposte.net",
+    "msn.com", "rediffmail.com", "gmx.de", "web.de", "libero.it"
+}
+
+class CompanyTrustRequest(BaseModel):
+    company_id: str
+    company_name: str
+    email: str
+    website_url: Optional[str] = None
+    trade_register: Optional[str] = None
+    description: Optional[str] = None
+    business_sector: Optional[str] = None
+    manager_name: Optional[str] = None
+    manager_email: Optional[str] = None
+    number_of_employees: Optional[int] = None
+    foundation_date: Optional[str] = None
+    address: Optional[str] = None
+
+class CompanyTrustResponse(BaseModel):
+    company_id: str
+    trust_score: int
+    details: dict
+    label: str
+
+# ─── Node 1 : Website + Domain Age + Social Media ────────────────────────────
+
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+def _whois_lookup(domain: str) -> dict:
+    """Isolé dans un thread avec timeout pour éviter le blocage."""
+    try:
+        import whois as python_whois
+        w = python_whois.whois(domain)
+        creation = w.creation_date
+        if isinstance(creation, list):
+            creation = creation[0]
+        if creation:
+            if hasattr(creation, 'tzinfo') and creation.tzinfo:
+                creation = creation.replace(tzinfo=None)
+            age_years = (datetime.datetime.now() - creation).days / 365.25
+            return {"age_years": round(age_years, 1), "created": str(creation.date())}
+    except Exception as e:
+        pass
+    return {"age_years": None, "created": None}
+
+def _resolve_ip_with_fallback(hostname: str) -> tuple[str | None, str]:
+    """
+    Resolve hostname to (IPv4, actual_hostname_used).
+    Tries: local DNS → Google DNS (bare domain) → Google DNS (www. prefix) → Google DNS (without www.)
+    Returns (ip, resolved_hostname) or (None, hostname).
+    """
+    candidates = [hostname]
+    if not hostname.startswith("www."):
+        candidates.append("www." + hostname)
+    else:
+        candidates.append(hostname[4:])  # without www
+
+    # 1. Local DNS
+    for h in candidates:
+        try:
+            results = socket.getaddrinfo(h, None, socket.AF_INET, socket.SOCK_STREAM)
+            if results:
+                return results[0][4][0], h
+        except socket.gaierror:
+            pass
+
+    # 2. Google DNS fallback
+    try:
+        import dns.resolver
+        resolver = dns.resolver.Resolver()
+        resolver.nameservers = ['8.8.8.8', '8.8.4.4', '1.1.1.1']
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        for h in candidates:
+            try:
+                answers = resolver.resolve(h, 'A')
+                return str(answers[0]), h
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None, hostname
+
+
+def _fetch_url_robust(url: str, headers: dict, timeout: int = 12) -> requests.Response | None:
+    """
+    Fetch a URL with SSL and DNS fallback.
+    - Tries verify=True first, then verify=False (for self-signed certs)
+    - If local DNS fails, resolves via Google DNS and connects to IP directly
+      with Host header set (bypasses local DNS restriction for .tn etc.)
+    """
+    import warnings
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    for verify_ssl in [True, False]:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                resp = requests.get(url, headers=headers, timeout=timeout,
+                                    allow_redirects=True, verify=verify_ssl)
+            return resp
+        except requests.exceptions.SSLError:
+            if verify_ssl:
+                continue  # retry without SSL verify
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            err_str = str(e)
+            if "getaddrinfo" in err_str or "NameResolution" in err_str or "11001" in err_str:
+                break  # DNS error — try Google DNS below
+            if not verify_ssl:
+                break
+            continue
+        except Exception:
+            break
+
+    # ── Google DNS fallback ────────────────────────────────────────────────
+    if not hostname:
+        return None
+
+    ip, resolved_host = _resolve_ip_with_fallback(hostname)
+    if not ip:
+        return None
+
+    print(f"[TRUST-N1] DNS fallback: {hostname} → {resolved_host} @ {ip}")
+
+    scheme = parsed.scheme
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    ip_url = f"{scheme}://{ip}:{port}{path}"
+    req_headers = dict(headers)
+    req_headers["Host"] = resolved_host  # Use the hostname that actually resolved
+
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            resp = requests.get(ip_url, headers=req_headers, timeout=timeout,
+                                allow_redirects=True, verify=False)
+        return resp
+    except Exception as e:
+        print(f"[TRUST-N1] DNS-fallback request error: {e}")
+
+    return None
+
+
+def node1_website_analysis(url: str, company_name: str) -> dict:
+    """
+    Vérifie existence du site, SSL, âge du domaine (whois),
+    et scrape les liens réseaux sociaux depuis la homepage.
+    Score max : 55 pts
+    """
+    result = {
+        "website_exists": False,
+        "ssl_valid": False,
+        "domain_age_years": None,
+        "response_time_ms": None,
+        "social_media": {
+            "linkedin": False,
+            "facebook": False,
+            "twitter": False,
+            "instagram": False,
+        },
+        "social_links_found": [],
+        "score": 0,
+        "details": []
+    }
+
+    if not url or not url.strip():
+        result["details"].append("no_website_provided")
+        return result
+
+    url = url.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    domain = parsed.netloc or parsed.path
+    # Strip port if present
+    domain = domain.split(":")[0]
+
+    # ── 1. SSL check (with DNS fallback) ─────────────────────────────────────
+    ssl_checked = False
+    # Resolve IP first (handles .tn and other locally-unresolvable domains)
+    resolved_ip, resolved_hostname = _resolve_ip_with_fallback(domain)
+    connect_host = resolved_ip if resolved_ip else domain
+    ssl_sni = resolved_hostname if resolved_ip else domain
+
+    for strict in [True, False]:
+        try:
+            ctx = ssl.create_default_context() if strict else ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if not strict:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((connect_host, 443), timeout=6) as sock:
+                with ctx.wrap_socket(sock, server_hostname=ssl_sni) as ssock:
+                    ssock.getpeercert()
+                    result["ssl_valid"] = strict
+                    result["score"] += 10
+                    result["details"].append("ssl_valid" if strict else "ssl_self_signed")
+                    ssl_checked = True
+                    break
+        except Exception:
+            if strict:
+                continue
+    if not ssl_checked:
+        result["details"].append("ssl_missing_or_invalid")
+
+    # ── 2. Site reachable + scrape social links ───────────────────────────────
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    }
+    homepage_html = None
+
+    # Build candidate URLs: prefer https, also try with/without www
+    candidates = [url]
+    if url.startswith("https://") and not domain.startswith("www."):
+        candidates.append(f"https://www.{domain}")
+    if url.startswith("https://"):
+        candidates.append(url.replace("https://", "http://"))
+    elif url.startswith("http://"):
+        candidates.append(url.replace("http://", "https://"))
+
+    for attempt_url in candidates:
+        t0 = time.time()
+        resp = _fetch_url_robust(attempt_url, headers, timeout=12)
+        if resp is not None and resp.status_code < 500:
+            elapsed = int((time.time() - t0) * 1000)
+            result["website_exists"] = True
+            result["response_time_ms"] = elapsed
+            result["score"] += 15
+            result["details"].append("website_reachable")
+            if resp.status_code < 400:
+                homepage_html = resp.text
+            break
+
+    if not result["website_exists"]:
+        result["details"].append("website_unreachable")
+
+    # ── 3. Social media detection (scrape homepage) ───────────────────────────
+    if homepage_html:
+        try:
+            soup = BeautifulSoup(homepage_html, "html.parser")
+
+            # Collect hrefs from <a> tags AND src/content from meta/iframe
+            all_hrefs = [a.get("href", "") or "" for a in soup.find_all("a", href=True)]
+            # Also check page raw text for social URLs (some sites embed them in JS/data attrs)
+            raw_lower = homepage_html.lower()
+
+            sm_map = {
+                "linkedin":  ["linkedin.com/company/", "linkedin.com/in/"],
+                "facebook":  ["facebook.com/"],
+                "twitter":   ["twitter.com/", "x.com/"],
+                "instagram": ["instagram.com/"],
+                "youtube":   ["youtube.com/channel/", "youtube.com/c/", "youtube.com/@"],
+            }
+            # Initialize all platforms as None (not detected)
+            for plat in sm_map:
+                result["social_media"][plat] = None
+
+            EXCLUDE = {"share", "intent", "login", "sharer", "watch?v=", "playlist", "hashtag"}
+
+            for platform, patterns in sm_map.items():
+                best_url = None
+
+                # 1. Check <a href> links — prefer exact profile links
+                for href in all_hrefs:
+                    href_l = href.lower()
+                    if not any(p in href_l for p in patterns):
+                        continue
+                    if any(ex in href_l for ex in EXCLUDE):
+                        continue
+                    # Normalize URL: ensure it's absolute
+                    if href.startswith("//"):
+                        href = "https:" + href
+                    elif href.startswith("/"):
+                        continue  # relative path, skip
+                    if not href.startswith("http"):
+                        continue
+                    best_url = href.rstrip("/")
+                    break
+
+                # 2. Fallback: extract URL from raw HTML (JS vars, data attrs, og: meta)
+                if not best_url:
+                    for p in patterns:
+                        idx = raw_lower.find(p)
+                        while idx != -1:
+                            # Walk back to find start of URL
+                            start = idx
+                            for c in range(min(50, idx), 0, -1):
+                                ch = homepage_html[idx - c]
+                                if ch in ('"', "'", '(', ' ', '\n', '='):
+                                    start = idx - c + 1
+                                    break
+                            # Walk forward to end of URL
+                            end = idx + len(p)
+                            for ch in homepage_html[end:end + 120]:
+                                if ch in ('"', "'", ')', ' ', '\n', '\\'):
+                                    break
+                                end += 1
+                            candidate = homepage_html[start:end].strip().strip('"\'')
+                            if candidate.startswith("http") and p in candidate.lower():
+                                if not any(ex in candidate.lower() for ex in EXCLUDE):
+                                    best_url = candidate.rstrip("/")
+                                    break
+                            idx = raw_lower.find(p, idx + 1)
+                        if best_url:
+                            break
+
+                if best_url:
+                    result["social_media"][platform] = best_url
+                    if best_url not in result["social_links_found"]:
+                        result["social_links_found"].append(best_url)
+
+            social_count = sum(1 for v in result["social_media"].values() if v)
+            if social_count >= 3:
+                result["score"] += 20
+                result["details"].append(f"social_media_strong_{social_count}_platforms")
+            elif social_count == 2:
+                result["score"] += 13
+                result["details"].append(f"social_media_good_2_platforms")
+            elif social_count == 1:
+                result["score"] += 6
+                result["details"].append("social_media_minimal_1_platform")
+            else:
+                result["details"].append("no_social_media_detected")
+
+        except Exception as e:
+            print(f"[TRUST-N1] Social scraping error: {e}")
+
+    # ── 4. Domain age via python-whois (thread + 8s timeout) ─────────────────
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(_whois_lookup, domain)
+            whois_data = future.result(timeout=8)
+        age_years = whois_data.get("age_years")
+        if age_years is not None:
+            result["domain_age_years"] = age_years
+            if age_years >= 5:
+                result["score"] += 10
+                result["details"].append(f"domain_age_{int(age_years)}y_established")
+            elif age_years >= 2:
+                result["score"] += 6
+                result["details"].append(f"domain_age_{int(age_years)}y")
+            elif age_years >= 0.5:
+                result["score"] += 3
+                result["details"].append(f"domain_age_recent")
+            else:
+                result["details"].append("domain_very_new")
+        else:
+            result["details"].append("whois_no_date")
+    except FutureTimeoutError:
+        print(f"[TRUST-N1] WHOIS timeout for {domain}")
+        result["details"].append("whois_timeout")
+    except Exception as e:
+        print(f"[TRUST-N1] WHOIS error: {e}")
+        result["details"].append("whois_error")
+
+    print(f"[TRUST-N1] {domain} → score={result['score']}, social={result['social_media']}, age={result.get('domain_age_years')}y")
+    return result
+
+
+# ─── Node 2 : Email Validation + Matching ────────────────────────────────────
+
+def node2_email_analysis(email: str, company_name: str, website_url: str) -> dict:
+    """
+    Valide l'email (format + MX records), vérifie si pro ou générique,
+    et teste le matching email ↔ site ↔ nom d'entreprise.
+    Score max : 55 pts
+    """
+    result = {
+        "email_valid_format": False,
+        "has_mx_records": False,
+        "is_professional": False,
+        "matches_website": False,
+        "matches_company_name": False,
+        "email_domain": "",
+        "score": 0,
+        "details": []
+    }
+
+    if not email:
+        result["details"].append("no_email_provided")
+        return result
+
+    email = email.lower().strip()
+    domain = email.split("@")[-1] if "@" in email else ""
+    result["email_domain"] = domain
+
+    # ── 1. Format + MX records ────────────────────────────────────────────────
+    try:
+        from email_validator import validate_email, EmailNotValidError
+        validated = validate_email(email, check_deliverability=True)
+        result["email_valid_format"] = True
+        result["has_mx_records"] = True
+        result["score"] += 10
+        result["details"].append("email_valid_with_mx")
+    except Exception:
+        try:
+            from email_validator import validate_email, EmailNotValidError
+            validated = validate_email(email, check_deliverability=False)
+            result["email_valid_format"] = True
+            result["score"] += 4
+            result["details"].append("email_valid_format_only")
+        except Exception:
+            result["details"].append("email_format_invalid")
+
+    # ── 2. Professional domain ────────────────────────────────────────────────
+    if domain and domain not in GENERIC_EMAIL_DOMAINS:
+        result["is_professional"] = True
+        result["score"] += 20
+        result["details"].append("professional_email_domain")
+    else:
+        result["details"].append("generic_email_domain_detected")
+
+    # ── 3. Email domain ↔ website domain ─────────────────────────────────────
+    if website_url and domain:
+        ws = website_url.lower()
+        for prefix in ["https://", "http://", "www."]:
+            ws = ws.replace(prefix, "")
+        ws_domain = ws.split("/")[0].split(":")[0]
+
+        # Exact match or subdomain
+        if domain == ws_domain or domain.endswith("." + ws_domain) or ws_domain.endswith("." + domain):
+            result["matches_website"] = True
+            result["score"] += 15
+            result["details"].append("email_exactly_matches_website")
+        else:
+            # Partial match (e.g. contact@myco.fr vs www.mycompany.fr)
+            ws_base = ws_domain.split(".")[0]
+            em_base = domain.split(".")[0]
+            if ws_base and em_base and (ws_base in em_base or em_base in ws_base):
+                result["matches_website"] = True
+                result["score"] += 8
+                result["details"].append("email_partially_matches_website")
+
+    # ── 4. Email domain ↔ company name ───────────────────────────────────────
+    if company_name and domain:
+        name_slug = re.sub(r"[^a-z0-9]", "", company_name.lower())
+        domain_base = re.sub(r"[^a-z0-9]", "", domain.split(".")[0])
+
+        if name_slug and domain_base:
+            if name_slug in domain_base or domain_base in name_slug:
+                result["matches_company_name"] = True
+                result["score"] += 10
+                result["details"].append("email_matches_company_name")
+            elif len(name_slug) >= 4 and len(domain_base) >= 4:
+                # Fuzzy: at least 4 chars in common at start
+                common = sum(1 for a, b in zip(name_slug, domain_base) if a == b)
+                if common >= 4:
+                    result["matches_company_name"] = True
+                    result["score"] += 5
+                    result["details"].append("email_fuzzy_matches_company_name")
+
+    print(f"[TRUST-N2] {email} → score={result['score']}, pro={result['is_professional']}, mx={result['has_mx_records']}")
+    return result
+
+
+# ─── Node 3 : AI Scoring (Ollama llama3.2 + rule-based fallback) ─────────────
+
+def node3_ai_scoring(company_data: dict, node1: dict, node2: dict) -> dict:
+    """
+    Utilise Ollama (llama3.2, local, gratuit) pour analyser tous les signaux
+    et produire un score final raisonné.
+    Fallback automatique sur scoring par règles si Ollama est indisponible.
+    """
+
+    # ── Rule-based score (fallback + base de référence) ───────────────────────
+    rule_score = node1["score"] + node2["score"]
+
+    # Bonus données entreprise
+    if company_data.get("trade_register") and len(str(company_data["trade_register"]).strip()) >= 3:
+        rule_score += 15
+    if company_data.get("address") and len(str(company_data["address"]).strip()) > 5:
+        rule_score += 5
+    if company_data.get("number_of_employees") and int(company_data["number_of_employees"]) > 0:
+        rule_score += 5
+    desc = company_data.get("description") or ""
+    word_count = len(desc.split())
+    if word_count >= 50:
+        rule_score += 8
+    elif word_count >= 20:
+        rule_score += 4
+    if company_data.get("manager_email") and company_data.get("email"):
+        if company_data["manager_email"].lower().strip() != company_data["email"].lower().strip():
+            rule_score += 5
+    if company_data.get("foundation_date"):
+        try:
+            fd = datetime.date.fromisoformat(str(company_data["foundation_date"]))
+            if fd < datetime.date.today() and fd.year >= 1850:
+                rule_score += 5
+        except Exception:
+            pass
+
+    rule_score = min(100, rule_score)
+
+    # ── Ollama AI scoring ─────────────────────────────────────────────────────
+    social_found = [k for k, v in node1.get("social_media", {}).items() if v]
+    social_str = ", ".join(social_found) if social_found else "none detected"
+    domain_age = node1.get("domain_age_years")
+    age_str = f"{domain_age} years old" if domain_age is not None else "unknown"
+
+    social_found = [k for k, v in node1.get("social_media", {}).items() if v]
+    prompt = (
+        f"Rate company trust 0-100. Return JSON only.\n"
+        f"Name:{company_data.get('company_name')} Sector:{company_data.get('business_sector','?')} "
+        f"Founded:{company_data.get('foundation_date','?')} Employees:{company_data.get('number_of_employees','?')}\n"
+        f"Website:{'OK' if node1['website_exists'] else 'MISSING'} "
+        f"SSL:{'OK' if node1['ssl_valid'] else 'MISSING'} "
+        f"DomainAge:{node1.get('domain_age_years','?')}y "
+        f"Social:{social_found if social_found else 'none'}\n"
+        f"Email:{company_data.get('email')} Pro:{'yes' if node2['is_professional'] else 'no'} "
+        f"MX:{'yes' if node2['has_mx_records'] else 'no'} "
+        f"MatchSite:{'yes' if node2['matches_website'] else 'no'}\n"
+        f"TradeReg:{'yes' if company_data.get('trade_register') else 'no'} "
+        f"Address:{'yes' if company_data.get('address') else 'no'}\n"
+        f"RuleScore:{rule_score}/100\n"
+        f'Output: {{"score":<0-100>,"label":"TRUSTED|REVIEW|SUSPICIOUS","reasoning":"<8 words>"}}'
+    )
+
+    try:
+        response = ollama.chat(
+            model="llama3.2",
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.0, "num_predict": 55},
+        )
+
+        raw = response["message"]["content"] if isinstance(response, dict) else response.message.content
+        raw = raw.strip()
+
+        # Extract JSON robustly
+        json_match = re.search(r'\{[^{}]*"score"\s*:\s*\d+[^{}]*\}', raw, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group())
+            ai_score = max(0, min(100, int(parsed.get("score", rule_score))))
+
+            # Blend: 65% AI + 35% rule-based for stability
+            blended = int(round(0.65 * ai_score + 0.35 * rule_score))
+            blended = max(0, min(100, blended))
+
+            print(f"[TRUST-N3] AI={ai_score}, rule={rule_score}, blended={blended}")
+            return {
+                "final_score": blended,
+                "ai_score": ai_score,
+                "rule_score": rule_score,
+                "reasoning": parsed.get("reasoning", ""),
+                "method": "ai_blended"
+            }
+
+    except Exception as e:
+        print(f"[TRUST-N3] Ollama unavailable ({e}), using rule-based score")
+
+    # Pure rule-based fallback
+    return {
+        "final_score": rule_score,
+        "ai_score": None,
+        "rule_score": rule_score,
+        "reasoning": "Scored via technical verification (AI model unavailable).",
+        "method": "rule_based"
+    }
+
+
+# ─── Main endpoint ────────────────────────────────────────────────────────────
+
+@app.post("/company/trust-score", response_model=CompanyTrustResponse)
+def compute_company_trust_score(req: CompanyTrustRequest):
+    """
+    Workflow 3-nœuds — Node1 + Node2 en PARALLÈLE, puis Node3 (AI scoring).
+    Timeout global : ~25 secondes maximum.
+    """
+    t_start = time.time()
+    print(f"\n[TRUST] ══ Starting for: {req.company_name} ══")
+
+    company_data = {
+        "company_name":        req.company_name,
+        "email":               req.email,
+        "website_url":         req.website_url,
+        "business_sector":     req.business_sector,
+        "trade_register":      req.trade_register,
+        "description":         req.description,
+        "number_of_employees": req.number_of_employees,
+        "foundation_date":     str(req.foundation_date) if req.foundation_date else None,
+        "address":             req.address,
+        "manager_email":       req.manager_email,
+    }
+
+    # ── Node 1 + Node 2 en parallèle (max 15s chacun) ─────────────────────
+    node1_result = {"website_exists": False, "ssl_valid": False, "domain_age_years": None,
+                    "social_media": {}, "social_links_found": [], "score": 0, "details": ["skipped"]}
+    node2_result = {"email_valid_format": False, "has_mx_records": False, "is_professional": False,
+                    "matches_website": False, "matches_company_name": False,
+                    "email_domain": "", "score": 0, "details": ["skipped"]}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(node1_website_analysis, req.website_url or "", req.company_name)
+        f2 = pool.submit(node2_email_analysis, req.email, req.company_name, req.website_url or "")
+        try:
+            node1_result = f1.result(timeout=15)
+        except FutureTimeoutError:
+            print("[TRUST] Node1 timeout (>15s)")
+            node1_result["details"] = ["node1_timeout"]
+        except Exception as e:
+            print(f"[TRUST] Node1 error: {e}")
+        try:
+            node2_result = f2.result(timeout=15)
+        except FutureTimeoutError:
+            print("[TRUST] Node2 timeout (>15s)")
+            node2_result["details"] = ["node2_timeout"]
+        except Exception as e:
+            print(f"[TRUST] Node2 error: {e}")
+
+    print(f"[TRUST] Nodes 1+2 done in {int((time.time()-t_start)*1000)}ms")
+
+    # ── Node 3 : AI scoring (max 20s, puis fallback règles) ───────────────
+    node3_result = {"final_score": 0, "method": "error"}
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            f3 = pool.submit(node3_ai_scoring, company_data, node1_result, node2_result)
+            node3_result = f3.result(timeout=20)
+    except FutureTimeoutError:
+        print("[TRUST] Node3 (Ollama) timeout — using rule-based fallback")
+        # Calcul fallback direct
+        score = node1_result.get("score", 0) + node2_result.get("score", 0)
+        if req.trade_register: score += 15
+        if req.address: score += 5
+        if req.number_of_employees: score += 5
+        if req.description and len(req.description.split()) >= 30: score += 8
+        if req.manager_email and req.email and req.manager_email.lower() != req.email.lower(): score += 5
+        node3_result = {"final_score": min(100, score), "method": "rule_based_timeout_fallback",
+                        "reasoning": "Scored via rules (AI timeout).", "ai_score": None, "rule_score": min(100, score)}
+    except Exception as e:
+        print(f"[TRUST] Node3 error: {e}")
+        node3_result = {"final_score": min(100, node1_result.get("score",0) + node2_result.get("score",0)),
+                        "method": "rule_based_error_fallback", "reasoning": str(e), "ai_score": None, "rule_score": 0}
+
+    final_score = node3_result["final_score"]
+    label = "TRUSTED" if final_score >= 75 else ("REVIEW" if final_score >= 45 else "SUSPICIOUS")
+
+    print(f"[TRUST] ══ {req.company_name}: {final_score}/100 → {label} in {int((time.time()-t_start)*1000)}ms ══\n")
+
+    return CompanyTrustResponse(
+        company_id=req.company_id,
+        trust_score=final_score,
+        label=label,
+        details={
+            "node1_website":  node1_result,
+            "node2_email":    node2_result,
+            "node3_scoring":  node3_result,
+        }
+    )
